@@ -68,6 +68,7 @@ pub fn parse(buf: &[u8], pos: &mut usize) -> Result<RespTypes, ParseError> {
         b'+' => parse_simple_string(buf, pos),
         b'-' => parse_error(buf, pos),
         b':' => parse_integer(buf, pos),
+        b'$' => parse_bulk_string(buf, pos),
         _ => Err(ParseError::Protocol("unknown RESP type".into())),
     }
 }
@@ -112,6 +113,50 @@ fn parse_integer(buf: &[u8], pos: &mut usize) -> Result<RespTypes, ParseError> {
         .map_err(|_| ParseError::Protocol("invalid number parsing error".into()))?;
 
     Ok(RespTypes::Integer(n))
+}
+
+/// `b"$5\r\nhello\r\n"` -> `BulkString(Some(b"hello"))`, `b"$-1\r\n"` -> `BulkString(None)`
+///
+/// Two lines: a length header, then that many raw bytes.
+/// The payload is taken by length, never by scanning for `\r\n`, because the
+/// bytes are binary and may contain a `\r\n` of their own.
+fn parse_bulk_string(buf: &[u8], pos: &mut usize) -> Result<RespTypes, ParseError> {
+    // Where we started, so an incomplete frame can be retried from scratch.
+    let frame_start = *pos;
+
+    let line = read_line(buf, pos)?;
+
+    // The null bulk string: what GET returns for a key that doesn't exist.
+    if &line[1..] == b"-1" {
+        return Ok(RespTypes::BulkString(None));
+    }
+
+    let length: usize = std::str::from_utf8(&line[1..])
+        .map_err(|_| ParseError::Protocol("invalid UTF-8".into()))?
+        .parse()
+        .map_err(|_| ParseError::Protocol("invalid bulk length".into()))?;
+
+    let start = *pos;
+    //Huge length must not wrap the addition around.
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| ParseError::Protocol("bulk length too large".into()))?;
+
+    // Payload plus its trailing \r\n
+    if end + 2 > buf.len() {
+        *pos = frame_start;
+        return Err(ParseError::Incomplete);
+    }
+
+    // Valid only if both bytes are right, so it's bad if *either* is wrong.
+    if buf[end] != b'\r' || buf[end + 1] != b'\n' {
+        return Err(ParseError::Protocol(
+            "bulk string not terminated by CRLF".into(),
+        ));
+    }
+
+    *pos = end + 2;
+    Ok(RespTypes::BulkString(Some(buf[start..end].to_vec())))
 }
 
 #[cfg(test)]
@@ -217,6 +262,117 @@ mod tests {
             parse(b":abc\r\n", &mut pos),
             Err(ParseError::Protocol(_))
         ));
+    }
+
+    // --- bulk strings ------------------------------------------------------
+
+    #[test]
+    fn parses_a_bulk_string() {
+        let mut pos = 0;
+        assert_eq!(
+            parse(b"$5\r\nhello\r\n", &mut pos),
+            Ok(RespTypes::BulkString(Some(b"hello".to_vec())))
+        );
+        assert_eq!(pos, 11);
+    }
+
+    #[test]
+    fn parses_an_empty_bulk_string() {
+        let mut pos = 0;
+        assert_eq!(
+            parse(b"$0\r\n\r\n", &mut pos),
+            Ok(RespTypes::BulkString(Some(vec![])))
+        );
+        assert_eq!(pos, 6);
+    }
+
+    #[test]
+    fn parses_a_null_bulk_string() {
+        // What GET returns when the key is missing.
+        let mut pos = 0;
+        assert_eq!(parse(b"$-1\r\n", &mut pos), Ok(RespTypes::BulkString(None)));
+        assert_eq!(pos, 5);
+    }
+
+    #[test]
+    fn bulk_string_payload_may_contain_crlf() {
+        // The reason the payload is taken by length instead of by scanning:
+        // these 5 bytes include a \r\n that is data, not a terminator.
+        let mut pos = 0;
+        assert_eq!(
+            parse(b"$5\r\na\r\nbc\r\n", &mut pos),
+            Ok(RespTypes::BulkString(Some(b"a\r\nbc".to_vec())))
+        );
+    }
+
+    #[test]
+    fn bulk_string_payload_may_be_binary() {
+        let mut pos = 0;
+        assert_eq!(
+            parse(b"$3\r\n\xff\x00\xfe\r\n", &mut pos),
+            Ok(RespTypes::BulkString(Some(vec![0xff, 0x00, 0xfe])))
+        );
+    }
+
+    #[test]
+    fn half_delivered_bulk_string_is_incomplete_not_a_panic() {
+        // Slicing without a bounds check here would crash the whole server.
+        let mut pos = 0;
+        assert_eq!(parse(b"$5\r\nhel", &mut pos), Err(ParseError::Incomplete));
+        // Cursor is back at the start so the frame can be retried.
+        assert_eq!(pos, 0);
+    }
+
+    #[test]
+    fn bulk_string_missing_its_trailing_crlf_is_a_protocol_error() {
+        let mut pos = 0;
+        assert!(matches!(
+            parse(b"$5\r\nhelloXX", &mut pos),
+            Err(ParseError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn bulk_string_with_only_one_bad_terminator_byte_is_rejected() {
+        // Catches `&&` where `||` is meant: here only the first byte is wrong,
+        // so an `&&` check would wave this through.
+        let mut pos = 0;
+        assert!(matches!(
+            parse(b"$5\r\nhelloX\n", &mut pos),
+            Err(ParseError::Protocol(_))
+        ));
+
+        // And the mirror case: only the second byte is wrong.
+        let mut pos = 0;
+        assert!(matches!(
+            parse(b"$5\r\nhello\rX", &mut pos),
+            Err(ParseError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn negative_bulk_length_other_than_minus_one_is_a_protocol_error() {
+        let mut pos = 0;
+        assert!(matches!(
+            parse(b"$-2\r\nab\r\n", &mut pos),
+            Err(ParseError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn reads_two_bulk_strings_from_one_buffer() {
+        let buf = b"$4\r\nECHO\r\n$5\r\nhello\r\n";
+        let mut pos = 0;
+
+        assert_eq!(
+            parse(buf, &mut pos),
+            Ok(RespTypes::BulkString(Some(b"ECHO".to_vec())))
+        );
+        assert_eq!(
+            parse(buf, &mut pos),
+            Ok(RespTypes::BulkString(Some(b"hello".to_vec())))
+        );
+        assert_eq!(pos, buf.len());
     }
 
     // --- parse dispatch ----------------------------------------------------
