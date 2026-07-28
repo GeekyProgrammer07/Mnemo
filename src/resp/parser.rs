@@ -69,6 +69,7 @@ pub fn parse(buf: &[u8], pos: &mut usize) -> Result<RespTypes, ParseError> {
         b'-' => parse_error(buf, pos),
         b':' => parse_integer(buf, pos),
         b'$' => parse_bulk_string(buf, pos),
+        b'*' => parse_array(buf, pos),
         _ => Err(ParseError::Protocol("unknown RESP type".into())),
     }
 }
@@ -157,6 +158,51 @@ fn parse_bulk_string(buf: &[u8], pos: &mut usize) -> Result<RespTypes, ParseErro
 
     *pos = end + 2;
     Ok(RespTypes::BulkString(Some(buf[start..end].to_vec())))
+}
+
+/// `b"*2\r\n:1\r\n:2\r\n"` -> `Array(Some([Integer(1), Integer(2)]))`,
+/// `b"*-1\r\n"` -> `Array(None)`
+///
+/// A count, then that many whole frames. Reading an element is just `parse`
+/// again, which is why nested arrays need no extra code.
+///
+/// An array is all-or-nothing: if any element is short, the whole frame is
+/// `Incomplete` and `pos` goes back to where it started.
+fn parse_array(buff: &[u8], pos: &mut usize) -> Result<RespTypes, ParseError> {
+    let frame_start = *pos;
+    let line = read_line(buff, pos)?;
+
+    if &line[1..] == b"-1" {
+        return Ok(RespTypes::Array(None));
+    }
+
+    let count: usize = std::str::from_utf8(&line[1..])
+        .map_err(|_| ParseError::Protocol("invalid UTF-8".into()))?
+        .parse()
+        .map_err(|_| ParseError::Protocol("invalid array length".into()))?;
+
+    // Every element needs at least 3 bytes on the wire (`+\r\n`), so a count
+    // bigger than the bytes left cannot be satisfied. Checking first stops
+    if count > buff.len() - *pos {
+        *pos = frame_start;
+        return Err(ParseError::Incomplete);
+    }
+
+    let mut replies: Vec<RespTypes> = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        match parse(buff, pos) {
+            Ok(frame) => replies.push(frame),
+            Err(error) => {
+                // If error occurs mid way due to anything we place the position
+                // at the start and act like nothing happened
+                *pos = frame_start;
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(RespTypes::Array(Some(replies)))
 }
 
 #[cfg(test)]
@@ -373,6 +419,100 @@ mod tests {
             Ok(RespTypes::BulkString(Some(b"hello".to_vec())))
         );
         assert_eq!(pos, buf.len());
+    }
+
+    // --- arrays ------------------------------------------------------------
+
+    #[test]
+    fn parses_a_command_array() {
+        // What a real client actually sends for: ECHO hello
+        let buf = b"*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n";
+        let mut pos = 0;
+        assert_eq!(
+            parse(buf, &mut pos),
+            Ok(RespTypes::Array(Some(vec![
+                RespTypes::BulkString(Some(b"ECHO".to_vec())),
+                RespTypes::BulkString(Some(b"hello".to_vec())),
+            ])))
+        );
+        assert_eq!(pos, buf.len());
+    }
+
+    #[test]
+    fn parses_an_empty_array() {
+        let mut pos = 0;
+        assert_eq!(
+            parse(b"*0\r\n", &mut pos),
+            Ok(RespTypes::Array(Some(vec![])))
+        );
+        assert_eq!(pos, 4);
+    }
+
+    #[test]
+    fn parses_a_null_array() {
+        let mut pos = 0;
+        assert_eq!(parse(b"*-1\r\n", &mut pos), Ok(RespTypes::Array(None)));
+        assert_eq!(pos, 5);
+    }
+
+    #[test]
+    fn parses_a_nested_array() {
+        // Nesting needs no extra code: reading an element is just `parse`.
+        let mut pos = 0;
+        assert_eq!(
+            parse(b"*1\r\n*2\r\n:5\r\n+OK\r\n", &mut pos),
+            Ok(RespTypes::Array(Some(vec![RespTypes::Array(Some(vec![
+                RespTypes::Integer(5),
+                RespTypes::SimpleString("OK".to_string()),
+            ]))])))
+        );
+    }
+
+    #[test]
+    fn parses_an_array_of_mixed_types() {
+        let mut pos = 0;
+        assert_eq!(
+            parse(b"*3\r\n:1\r\n$2\r\nhi\r\n-ERR x\r\n", &mut pos),
+            Ok(RespTypes::Array(Some(vec![
+                RespTypes::Integer(1),
+                RespTypes::BulkString(Some(b"hi".to_vec())),
+                RespTypes::Error("ERR x".to_string()),
+            ])))
+        );
+    }
+
+    #[test]
+    fn half_delivered_array_rewinds_the_cursor() {
+        // The count says 2 but only one element arrived. Without the rewind,
+        // pos would be left after `:1\r\n` and the retry would resume
+        // mid-array, misreading everything from there on.
+        let mut pos = 0;
+        assert_eq!(
+            parse(b"*2\r\n:1\r\n", &mut pos),
+            Err(ParseError::Incomplete)
+        );
+        assert_eq!(pos, 0);
+    }
+
+    #[test]
+    fn array_element_that_is_garbage_is_a_protocol_error() {
+        let mut pos = 0;
+        assert!(matches!(
+            parse(b"*1\r\n?bad\r\n", &mut pos),
+            Err(ParseError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn absurd_array_count_does_not_allocate() {
+        // 12 bytes claiming a billion elements. Reserving for that count up
+        // front would try for gigabytes of memory.
+        let mut pos = 0;
+        assert_eq!(
+            parse(b"*999999999\r\n", &mut pos),
+            Err(ParseError::Incomplete)
+        );
+        assert_eq!(pos, 0);
     }
 
     // --- parse dispatch ----------------------------------------------------
