@@ -60,6 +60,8 @@ dependencies = [
 name = "mnemo"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "socket2",
  "tokio",
 ]
 
