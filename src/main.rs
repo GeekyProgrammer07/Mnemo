@@ -5,6 +5,11 @@ use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use crate::command::dispatch;
+use crate::resp::encoder::encode;
+use crate::resp::parser::{ParseError, parse};
+
+mod command;
 mod resp;
 
 #[tokio::main]
@@ -41,25 +46,38 @@ async fn main() -> std::io::Result<()> {
             // Grows on demand, so one big command doesn't cost several reads from kernel.
             // A fixed array would also erase a half-delivered command.
             // `read_buf()` appends existing buffer
-            let mut buf = BytesMut::with_capacity(4096);
-
+            let mut inbox = BytesMut::with_capacity(4096);
+            // How far into `inbox` the parser has already consumed.
+            let mut parsed_upto = 0;
             loop {
-                let n = match stream.read_buf(&mut buf).await {
+                let bytes_read = match stream.read_buf(&mut inbox).await {
                     Ok(0) => {
                         println!("closed: {addr}");
                         return;
                     }
-                    Ok(n) => n,
+                    Ok(count) => count,
                     Err(e) => {
                         eprintln!("read error from {addr}: {e}");
                         return;
                     }
                 };
 
-                println!("got {n} bytes: {:?}", &buf[..n]);
+                println!("got {bytes_read} bytes: {:?}", &inbox[..bytes_read]);
 
-                // Hardcoded for now. The parser goes here next.
-                if let Err(e) = stream.write_all(b"+PONG\r\n").await {
+                let request = match parse(&inbox, &mut parsed_upto) {
+                    Ok(frame) => frame,
+                    Err(ParseError::Incomplete) => continue,
+                    Err(ParseError::Protocol(msg)) => {
+                        eprintln!("protocol error from {addr}: {msg}");
+                        return;
+                    }
+                };
+
+                let reply = dispatch(request);
+                let reply_bytes = encode(&reply);
+                // `write_all`, not `write`: a plain write may send only part of the
+                // buffer and report how much, which would truncate the reply.
+                if let Err(e) = stream.write_all(&reply_bytes).await {
                     eprintln!("write error to {addr}: {e}");
                     return;
                 }
