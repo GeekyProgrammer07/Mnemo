@@ -1,16 +1,20 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use socket2::{Domain, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 
-use crate::command::dispatch;
+use crate::dispatch::dispatch;
 use crate::resp::encoder::encode;
-use crate::resp::parser::{ParseError, parse};
+use crate::resp::parser::{ParseError, parse_command};
+use crate::store::db::Db;
 
-mod command;
+mod dispatch;
 mod resp;
+mod store;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -33,7 +37,7 @@ async fn main() -> std::io::Result<()> {
 
     let listener = TcpListener::from_std(socket.into())?;
     println!("listening on 127.0.0.1:6379");
-
+    let store = Arc::new(Mutex::new(Db::default()));
     loop {
         // Wait here until somebody connects.
         let (mut stream, addr) = listener.accept().await?;
@@ -41,6 +45,8 @@ async fn main() -> std::io::Result<()> {
         // Turn off Nagle's algorithm. It holds small writes back for a moment
         // hoping to batch them, which would add latency to every reply.
         stream.set_nodelay(true)?;
+
+        let store_for_each_conn = Arc::clone(&store);
         // Hand this client off and go straight back to accepting.
         tokio::spawn(async move {
             // Grows on demand, so one big command doesn't cost several reads from kernel.
@@ -50,7 +56,7 @@ async fn main() -> std::io::Result<()> {
             // How far into `inbox` the parser has already consumed.
             let mut parsed_upto = 0;
             loop {
-                let bytes_read = match stream.read_buf(&mut inbox).await {
+                let _bytes_read = match stream.read_buf(&mut inbox).await {
                     Ok(0) => {
                         println!("closed: {addr}");
                         return;
@@ -62,9 +68,7 @@ async fn main() -> std::io::Result<()> {
                     }
                 };
 
-                println!("got {bytes_read} bytes: {:?}", &inbox[..bytes_read]);
-
-                let request = match parse(&inbox, &mut parsed_upto) {
+                let request = match parse_command(&inbox, &mut parsed_upto) {
                     Ok(frame) => frame,
                     Err(ParseError::Incomplete) => continue,
                     Err(ParseError::Protocol(msg)) => {
@@ -73,7 +77,8 @@ async fn main() -> std::io::Result<()> {
                     }
                 };
 
-                let reply = dispatch(request);
+                let mut guard = store_for_each_conn.lock().await;
+                let reply = dispatch(request, &mut guard);
                 let reply_bytes = encode(&reply);
                 // `write_all`, not `write`: a plain write may send only part of the
                 // buffer and report how much, which would truncate the reply.
@@ -81,6 +86,8 @@ async fn main() -> std::io::Result<()> {
                     eprintln!("write error to {addr}: {e}");
                     return;
                 }
+                inbox.advance(parsed_upto);
+                parsed_upto = 0;
             }
         });
     }
