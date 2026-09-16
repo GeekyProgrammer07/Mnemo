@@ -7,8 +7,12 @@
 /// types RESP gives a null form: `$-1\r\n` (key doesn't exist) and `*-1\r\n`.
 #[derive(Debug, PartialEq)]
 pub enum RespTypes {
+    /// `+OK\r\n` — short fixed replies like `+OK` and `+PONG`.
     SimpleString(String),
+    /// `-ERR bad thing\r\n` — an error the server *replies* with. Reading it
+    /// worked fine, so it is not a `ParseError`.
     Error(String),
+    /// `:42\r\n` — what `DEL` and `EXISTS` reply with.
     Integer(i64),
     /// `Vec<u8>`, not `String`: Redis values are binary-safe.
     BulkString(Option<Vec<u8>>),
@@ -59,6 +63,16 @@ fn read_line<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8], ParseError>
 ///
 /// The two formats split here, at the top level, and nowhere else:
 /// a leading `*` is a RESP array, anything else is an inline command.
+///
+/// # Example
+///
+/// ```text
+/// *3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n   what redis-cli sends
+/// SET foo bar\r\n                                what you type into nc
+/// ```
+///
+/// Both come out as `Array([Bulk("SET"), Bulk("foo"), Bulk("bar")])`, so
+/// `dispatch` never learns which one was used.
 pub fn parse_command(buf: &[u8], pos: &mut usize) -> Result<RespTypes, ParseError> {
     if *pos >= buf.len() {
         return Err(ParseError::Incomplete);
@@ -75,6 +89,15 @@ pub fn parse_command(buf: &[u8], pos: &mut usize) -> Result<RespTypes, ParseErro
 /// we do not skip it. Each helper removes it later.
 ///
 /// Call this again with the same `pos` to read the next value.
+///
+/// # Example
+///
+/// ```text
+/// buf = b":1\r\n:2\r\n"
+/// parse(buf, &mut pos)  // pos 0 -> 4, Integer(1)
+/// parse(buf, &mut pos)  // pos 4 -> 8, Integer(2)
+/// parse(buf, &mut pos)  // Err(Incomplete)
+/// ```
 pub fn parse(buf: &[u8], pos: &mut usize) -> Result<RespTypes, ParseError> {
     // Not `buf.is_empty()`: with back-to-back frames the buffer is full but
     // the cursor can already sit at the end.

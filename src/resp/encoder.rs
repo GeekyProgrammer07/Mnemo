@@ -4,6 +4,18 @@ use crate::resp::parser::RespTypes;
 ///
 /// The opposite of `parse`. There is no `Result` because there is nothing to
 /// reject: the value is already valid, so encoding cannot fail.
+///
+/// # Example
+///
+/// ```text
+/// SimpleString("OK")             ->  +OK\r\n
+/// Error("ERR bad")               ->  -ERR bad\r\n
+/// Integer(42)                    ->  :42\r\n
+/// BulkString(Some(b"hello"))     ->  $5\r\nhello\r\n
+/// BulkString(None)               ->  $-1\r\n            (nil)
+/// Array(Some([Int(1), Int(2)]))  ->  *2\r\n:1\r\n:2\r\n
+/// Array(None)                    ->  *-1\r\n
+/// ```
 pub fn encode(value: &RespTypes) -> Vec<u8> {
     match value {
         RespTypes::SimpleString(s) => format!("+{}\r\n", s).into_bytes(),

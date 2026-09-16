@@ -16,6 +16,16 @@ mod dispatch;
 mod resp;
 mod store;
 
+/// Starts the server: build the socket, then accept clients forever.
+///
+/// Each client gets its own task, and every task runs the same four steps:
+///
+/// ```text
+/// read bytes  ->  parse_command  ->  dispatch  ->  encode  ->  write back
+/// ```
+///
+/// `#[tokio::main]` wraps this in a normal `fn main` that starts the async
+/// runtime — without it nothing would drive the `.await`s.
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let addr: SocketAddr = "127.0.0.1:6379".parse().unwrap();
@@ -46,6 +56,7 @@ async fn main() -> std::io::Result<()> {
         // hoping to batch them, which would add latency to every reply.
         stream.set_nodelay(true)?;
 
+        // NOTE: Wont this be read only like we have the store as `&` which is borrowed reference
         let store_for_each_conn = Arc::clone(&store);
         // Hand this client off and go straight back to accepting.
         tokio::spawn(async move {

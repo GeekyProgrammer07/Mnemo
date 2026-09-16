@@ -19,6 +19,12 @@ Listens on `127.0.0.1:6379`, the standard Redis port, so any Redis client works:
 redis-cli -p 6379 PING
 ```
 
+No `redis-cli` installed? just get docker
+
+```bash
+docker run --network host -it redis:latest redis-cli -p 6379
+```
+
 Or send raw RESP with nothing in between:
 
 ```bash
@@ -45,7 +51,32 @@ exists — they are the roadmap, not a problem. See `tests/`.
 ## Where it is
 
 TCP server, RESP2 parse/encode, inline commands, `PING` `ECHO` `SET` `GET`
-`DEL` `EXISTS` `TYPE`.
+`DEL` `EXISTS` `TYPE` `MSET` `MGET`.
+
+All of them work in `redis-cli` exactly as they do against real Redis:
+
+```
+127.0.0.1:6379> PING
+PONG
+127.0.0.1:6379> SET name suman
+OK
+127.0.0.1:6379> GET name
+"suman"
+127.0.0.1:6379> MSET a 1 b 2
+OK
+127.0.0.1:6379> MGET a nope b
+1) "1"
+2) (nil)
+3) "2"
+127.0.0.1:6379> TYPE name
+string
+127.0.0.1:6379> EXISTS name nope
+(integer) 1
+127.0.0.1:6379> DEL name
+(integer) 1
+127.0.0.1:6379> GET name
+(nil)
+```
 
 ## Docs
 

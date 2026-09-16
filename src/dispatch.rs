@@ -1,13 +1,23 @@
 use crate::{
-    resp::parser::RespTypes,
-    store::{db::Db, value::RedisValue},
+    resp::parser::RespTypes::{self, BulkString},
+    store::{
+        db::Db,
+        value::RedisValue,
+    },
 };
 
-/// Turns a frame the client sent into the frame we should send back.
+/// Runs one command and returns the reply to send back.
 ///
-/// Clients always send an array of bulk strings: element 0 is the command name,
-/// the rest are its arguments. Anything else is a client mistake, and a client
-/// mistake is a normal `-ERR` reply
+/// A command is always an array: element 0 is the name, the rest are the
+/// arguments. Anything else gets an `-ERR` reply, not a dropped connection.
+///
+/// # Example
+///
+/// ```text
+/// ["PING"]          -> +PONG
+/// ["GET", "nope"]   -> $-1   (nil)
+/// ["BLAH"]          -> -ERR unknown command 'BLAH'
+/// ```
 pub fn dispatch(frame: RespTypes, store: &mut Db) -> RespTypes {
     let parts = match frame {
         RespTypes::Array(Some(parts)) if !parts.is_empty() => parts,
@@ -40,10 +50,21 @@ pub fn dispatch(frame: RespTypes, store: &mut Db) -> RespTypes {
         "DEL" => cmd_del(&args, store),
         "EXISTS" => cmd_exists(&args, store),
         "TYPE" => cmd_type(&args, store),
+        "MSET" => cmd_mset(args, store),
+        "MGET" => cmd_mget(&args, store),
         other => error(&format!("ERR unknown command '{other}'")),
     }
 }
 
+/// `PING` — the "are you alive?" command.
+///
+/// # Example
+///
+/// ```text
+/// PING        -> +PONG
+/// PING hello  -> $5\r\nhello   (echoes the argument instead)
+/// PING a b    -> -ERR wrong number of arguments for 'ping' command
+/// ```
 fn cmd_ping(mut args: Vec<Vec<u8>>) -> RespTypes {
     match args.len() {
         0 => RespTypes::SimpleString("PONG".to_string()),
@@ -53,6 +74,14 @@ fn cmd_ping(mut args: Vec<Vec<u8>>) -> RespTypes {
     }
 }
 
+/// `ECHO message` — sends the same message straight back.
+///
+/// # Example
+///
+/// ```text
+/// ECHO hello  -> $5\r\nhello
+/// ECHO        -> -ERR wrong number of arguments for 'echo' command
+/// ```
 fn cmd_echo(mut args: Vec<Vec<u8>>) -> RespTypes {
     match args.len() {
         1 => RespTypes::BulkString(Some(args.remove(0))),
@@ -60,6 +89,15 @@ fn cmd_echo(mut args: Vec<Vec<u8>>) -> RespTypes {
     }
 }
 
+/// `SET key value` — stores bytes under a key. Overwriting is fine.
+///
+/// # Example
+///
+/// ```text
+/// SET foo bar  -> +OK
+/// SET foo baz  -> +OK   (replaces the old value)
+/// SET foo      -> -ERR wrong number of arguments for 'set' command
+/// ```
 fn cmd_set(mut args: Vec<Vec<u8>>, store: &mut Db) -> RespTypes {
     if args.len() != 2 {
         return wrong_arity("set");
@@ -76,6 +114,14 @@ fn cmd_set(mut args: Vec<Vec<u8>>, store: &mut Db) -> RespTypes {
     RespTypes::SimpleString("OK".to_string())
 }
 
+/// `GET key` — the stored bytes, or nil if the key isn't there.
+///
+/// # Example
+///
+/// ```text
+/// GET foo   -> $3\r\nbar
+/// GET nope  -> $-1        (redis-cli shows this as "(nil)")
+/// ```
 fn cmd_get(args: &[Vec<u8>], store: &Db) -> RespTypes {
     if args.len() != 1 {
         return wrong_arity("get");
@@ -92,6 +138,17 @@ fn cmd_get(args: &[Vec<u8>], store: &Db) -> RespTypes {
     }
 }
 
+/// `DEL key [key ...]` — deletes keys, replies how many were actually removed.
+///
+/// Deleting a key that isn't there is not an error, it just doesn't count.
+///
+/// # Example
+///
+/// ```text
+/// DEL foo         -> :1
+/// DEL foo         -> :0   (already gone)
+/// DEL a b nothing -> :2
+/// ```
 fn cmd_del(args: &[Vec<u8>], store: &mut Db) -> RespTypes {
     if args.is_empty() {
         return wrong_arity("del");
@@ -108,6 +165,15 @@ fn cmd_del(args: &[Vec<u8>], store: &mut Db) -> RespTypes {
     RespTypes::Integer(removed)
 }
 
+/// `EXISTS key [key ...]` — how many of these keys exist.
+///
+/// # Example
+///
+/// ```text
+/// EXISTS foo      -> :1
+/// EXISTS foo foo  -> :2   (repeats counted twice, not de-duplicated)
+/// EXISTS nope     -> :0
+/// ```
 fn cmd_exists(args: &[Vec<u8>], store: &Db) -> RespTypes {
     if args.is_empty() {
         return wrong_arity("exists");
@@ -124,6 +190,14 @@ fn cmd_exists(args: &[Vec<u8>], store: &Db) -> RespTypes {
     RespTypes::Integer(found)
 }
 
+/// `TYPE key` — the type name of the stored value.
+///
+/// # Example
+///
+/// ```text
+/// TYPE foo   -> +string
+/// TYPE nope  -> +none     (not an error, not nil)
+/// ```
 fn cmd_type(args: &[Vec<u8>], store: &Db) -> RespTypes {
     if args.len() != 1 {
         return wrong_arity("type");
@@ -136,27 +210,112 @@ fn cmd_type(args: &[Vec<u8>], store: &Db) -> RespTypes {
     RespTypes::SimpleString(store.type_of(&key).unwrap_or("none").to_string())
 }
 
-/// Turns the raw bytes of an argument into a key, or gives back the error to
-/// reply with.
+/// `MSET key value [key value ...]` — set many keys at once. Always `+OK`.
 ///
-/// Arguments arrive as `Vec<u8>` because a *value* can be any bytes at all —
-/// a JPEG, a compressed blob, anything. But `Db` stores keys as `String`, so
-/// a key has to be valid UTF-8. This is where that check happens, once, in
-/// one place, instead of in every command.
+/// All or nothing: every key is checked *before* anything is written, so a bad
+/// key means nothing was stored and there is nothing to roll back.
 ///
-/// Real Redis allows binary keys too. Requiring text is a simplification: keys
-/// are names in practice, and `String` keeps the store simpler to read.
+/// # Example
+///
+/// ```text
+/// MSET a 1 b 2  ->  +OK
+/// MSET a 1 b    ->  -ERR wrong number of arguments for 'mset' command
+/// ```
+fn cmd_mset(args: Vec<Vec<u8>>, store: &mut Db) -> RespTypes {
+    if args.len() % 2 != 0 {
+        return wrong_arity("mset");
+    }
+
+    let mut pairs = Vec::with_capacity(args.len() / 2);
+    let mut iter = args.into_iter();
+
+    while let Some(key) = iter.next() {
+        let value = iter.next().unwrap();
+        match key_of(&key) {
+            Ok(key) => pairs.push((key, value)),
+            Err(reply) => return reply,
+        }
+    }
+    for (key, value) in pairs {
+        store.set(key, RedisValue::String(value));
+    }
+
+    RespTypes::SimpleString("OK".to_string())
+}
+
+/// `MGET key [key ...]` — get many keys at once.
+///
+/// Always one element per key, in the order asked. A missing key gets a nil in
+/// its slot, never a skipped slot — otherwise the positions shift and the
+/// client can't tell which key gave what. Never fails on a bad key: it just
+/// can't exist, so that is a nil too.
+///
+/// # Example
+///
+/// ```text
+/// MGET a nope b  ->  *3\r\n$1\r\n1\r\n$-1\r\n$1\r\n2\r\n
+///
+/// which redis-cli prints as:
+///     1) "1"
+///     2) (nil)
+///     3) "2"
+/// ```
+fn cmd_mget(args: &[Vec<u8>], store: &Db) -> RespTypes {
+    if args.is_empty() {
+        return wrong_arity("mget");
+    }
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        let reply = match key_of(arg) {
+            Ok(key) => match store.get(&key) {
+                Some(RedisValue::String(bytes)) => BulkString(Some(bytes.clone())),
+                None => BulkString(None),
+            },
+            Err(_) => BulkString(None),
+        };
+        out.push(reply);
+    }
+
+    RespTypes::Array(Some(out))
+}
+
+/// Turns argument bytes into a key, or gives back the error frame to reply with.
+///
+/// Values can be any bytes (a JPEG, say), but keys must be valid UTF-8 because
+/// `Db` stores them as `String`. This is the one place that is checked.
+///
+/// # Example
+///
+/// ```text
+/// key_of(b"foo")   -> Ok("foo")
+/// key_of(b"\xff")  -> Err(-ERR key must be valid UTF-8)
+/// ```
 fn key_of(bytes: &[u8]) -> Result<String, RespTypes> {
     String::from_utf8(bytes.to_vec()).map_err(|_| error("ERR key must be valid UTF-8"))
 }
 
-/// [Redis](https://redis.io/docs/latest/develop/reference/modules/#arity-and-type-checkswords) uses this identically for every command,
+/// The "wrong number of arguments" error, worded exactly as Redis words it.
+///
+/// Clients match on this text, so it lives in one place.
+///
+/// # Example
+///
+/// ```text
+/// wrong_arity("get")  ->  -ERR wrong number of arguments for 'get' command
+/// ```
 fn wrong_arity(command: &str) -> RespTypes {
     error(&format!(
         "ERR wrong number of arguments for '{command}' command"
     ))
 }
 
+/// Wraps a message as a RESP error frame.
+///
+/// # Example
+///
+/// ```text
+/// error("ERR nope")  ->  -ERR nope\r\n
+/// ```
 fn error(message: &str) -> RespTypes {
     RespTypes::Error(message.to_string())
 }
